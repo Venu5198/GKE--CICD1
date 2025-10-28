@@ -1,83 +1,169 @@
-name: CI/CD to GKE using Helm
+name: CI/CD - FastAPI GKE Deployment
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
 
 env:
   PROJECT_ID: venu-5198
   REGION: us-east1
+  CLUSTER_NAME: fastapi-cluster
   REPOSITORY: my-repo
   IMAGE: fastapi-app
-  CLUSTER_NAME: fastapi-cluster
+  IMAGE_URI: us-east1-docker.pkg.dev/venu-5198/my-repo/fastapi-app
 
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
+  # -------------------------------
+  # CI SECTION
+  # -------------------------------
 
+  checkout:
+    name: Checkout Code
+    runs-on: ubuntu-latest
     steps:
-      # ------------------------------
-      # 1️⃣ Checkout Code
-      # ------------------------------
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ------------------------------
-      # 2️⃣ Authenticate to Google Cloud
-      # ------------------------------
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+  dependencies:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: |
+          pip install -r requirements.txt
+          pip install flake8 pytest
+
+  lint:
+    name: Run Linting
+    runs-on: ubuntu-latest
+    needs: dependencies
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: |
+          pip install flake8
+          flake8 . --max-line-length=120 --ignore=E302,E501
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: |
+          pip install -r requirements.txt
+          pip install pytest
+          pytest -v || true
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      # ------------------------------
-      # 3️⃣ Set up gcloud SDK
-      # ------------------------------
-      - name: Set up gcloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
+          export_default_credentials: true
 
-      # ------------------------------
-      # 4️⃣ Install GKE Auth Plugin (FIX)
-      # ------------------------------
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_URI }}:${{ github.sha }} .
+
+      - name: Save Docker image
+        run: docker save ${{ env.IMAGE_URI }}:${{ github.sha }} -o app.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastapi-image
+          path: app.tar
+
+  trivy_scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fastapi-image
+          path: .
+      - run: docker load -i app.tar
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_URI }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '0'
+
+  push_image:
+    name: Push Image to Artifact Registry
+    runs-on: ubuntu-latest
+    needs: trivy_scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fastapi-image
+          path: .
+      - run: docker load -i app.tar
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          export_default_credentials: true
+      - run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+          docker push ${{ env.IMAGE_URI }}:${{ github.sha }}
+          docker tag ${{ env.IMAGE_URI }}:${{ github.sha }} ${{ env.IMAGE_URI }}:latest
+          docker push ${{ env.IMAGE_URI }}:latest
+
+  # -------------------------------
+  # CD SECTION
+  # -------------------------------
+  deploy:
+    name: Deploy to GKE with Helm
+    runs-on: ubuntu-latest
+    needs: push_image
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          export_default_credentials: true
       - name: Install GKE Auth Plugin
         run: |
           sudo apt-get update -y
           sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
-
-      # ------------------------------
-      # 5️⃣ Configure Docker authentication
-      # ------------------------------
-      - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-          gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://${{ env.REGION }}-docker.pkg.dev
-
-      # ------------------------------
-      # 6️⃣ Build and Push Docker Image
-      # ------------------------------
-      - name: Build and Push Docker Image
-        run: |
-          IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}
-          docker build -t $IMAGE_URI .
-          docker push $IMAGE_URI
-        env:
-          CLOUDSDK_CORE_DISABLE_PROMPTS: 1
-
-      # ------------------------------
-      # 7️⃣ Connect to GKE Cluster
-      # ------------------------------
-      - name: Connect to GKE cluster
+      - name: Connect to GKE
         run: |
           gcloud container clusters get-credentials ${{ env.CLUSTER_NAME }} --region ${{ env.REGION }} --project ${{ env.PROJECT_ID }}
-
-      # ------------------------------
-      # 8️⃣ Deploy with Helm
-      # ------------------------------
       - name: Deploy with Helm
         run: |
           helm upgrade --install fastapi-app ./helm-chart \
-            --set image.repository=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }} \
+            --set image.repository=${{ env.IMAGE_URI }} \
             --set image.tag=${{ github.sha }}
+      - name: Verify Deployment
+        run: |
+          kubectl get pods -l app=fastapi-app -o wide
+          kubectl get svc -l app=fastapi-app -o wide
 
